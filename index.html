@@ -1,0 +1,299 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Object Detection (OpenCV.js + coco-ssd)</title>
+  <style>
+    :root{ --bg:#0f1724; --panel:#0b1220; --accent:#06b6d4; --muted:#cbd5e1; }
+    body{ margin:0; font-family:Inter,system-ui,Arial; background:linear-gradient(180deg,#071026 0%, #071a2a 100%); color:var(--muted); display:flex; min-height:100vh; align-items:center; justify-content:center; padding:20px; box-sizing:border-box;}
+    .app{ width:100%; max-width:980px; background:rgba(255,255,255,0.02); border-radius:12px; padding:18px; box-shadow:0 8px 30px rgba(2,6,23,0.7); }
+    .top{ display:flex; gap:12px; align-items:center; margin-bottom:12px; }
+    .controls{ display:flex; gap:8px; align-items:center; margin-left:auto; }
+    button{ background:var(--panel); color:var(--muted); border:1px solid rgba(255,255,255,0.04); padding:8px 12px; border-radius:8px; cursor:pointer; }
+    button.primary{ background:linear-gradient(90deg,#06b6d4,#3b82f6); color:#022; font-weight:600; border:none; }
+    select{ background:var(--panel); color:var(--muted); padding:8px; border-radius:8px; border:1px solid rgba(255,255,255,0.03); }
+    #status{ font-size:13px; color:var(--muted); }
+    .layout{ display:flex; gap:12px; align-items:flex-start; }
+    .viewer{ position:relative; background:#000; border-radius:8px; overflow:hidden; flex:1; min-height:420px; display:flex; align-items:center; justify-content:center;}
+    video{ display:none; } /* we use canvas for display */
+    canvas{ max-width:100%; display:block; }
+    .panel{ width:300px; padding:12px; background:linear-gradient(180deg, rgba(255,255,255,0.02), rgba(255,255,255,0.01)); border-radius:8px; border:1px solid rgba(255,255,255,0.03); }
+    h3{ margin:0 0 8px 0; font-size:16px; color:#fff;}
+    .list{ max-height:360px; overflow:auto; font-size:14px; }
+    .item{ padding:8px; border-bottom:1px dashed rgba(255,255,255,0.02); display:flex; justify-content:space-between; align-items:center; }
+    .label{ font-weight:600; color:#fff; }
+    .score{ color:var(--muted); font-size:13px; }
+    footer{ margin-top:12px; font-size:13px; color:var(--muted); text-align:center;}
+    .loader{ display:inline-block; width:10px; height:10px; border-radius:50%; background:var(--accent); margin-left:8px; animation:blink 1s infinite; vertical-align:middle;}
+    @keyframes blink{ 0%{opacity:1}50%{opacity:.2}100%{opacity:1} }
+  </style>
+</head>
+<body>
+  <div class="app">
+    <div class="top">
+      <div>
+        <h2 style="margin:0;color:white">Object Detection — OpenCV.js + coco-ssd</h2>
+        <div id="status">Loading libraries... <span class="loader"></span></div>
+      </div>
+      <div class="controls">
+        <label for="camSelect" style="font-size:13px;color:var(--muted)">Camera:</label>
+        <select id="camSelect"></select>
+        <button id="startBtn" class="primary">Start</button>
+        <button id="stopBtn">Stop</button>
+      </div>
+    </div>
+
+    <div class="layout">
+      <div class="viewer">
+        <!-- hidden video used as input source -->
+        <video id="video" playsinline></video>
+        <!-- canvas where we'll draw video + detections -->
+        <canvas id="outputCanvas"></canvas>
+      </div>
+
+      <div class="panel">
+        <h3>Detected (live)</h3>
+        <div class="list" id="detList">No detections yet.</div>
+        <footer>
+          <div>Model: <strong>coco-ssd</strong> • Using OpenCV.js for canvas handling.</div>
+        </footer>
+      </div>
+    </div>
+  </div>
+
+  <!-- Load TensorFlow.js and coco-ssd model -->
+  <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@4.11.0/dist/tf.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@tensorflow-models/coco-ssd@2.2.2/dist/coco-ssd.min.js"></script>
+
+  <!-- Load OpenCV.js (from OpenCV official docs CDN). Keep a fallback: it's a big file. -->
+  <script async src="https://docs.opencv.org/4.7.0/opencv.js" onload="openCvReady()" onerror="openCvError()"></script>
+
+  <script>
+  // Globals
+  let video = document.getElementById('video');
+  let canvas = document.getElementById('outputCanvas');
+  let ctx = canvas.getContext('2d');
+  let model = null;
+  let stream = null;
+  let detecting = false;
+  let detectInterval = 200; // ms between detections
+  let statusEl = document.getElementById('status');
+  let detList = document.getElementById('detList');
+  let camSelect = document.getElementById('camSelect');
+  let startBtn = document.getElementById('startBtn');
+  let stopBtn = document.getElementById('stopBtn');
+
+  // Buttons
+  startBtn.onclick = startCamera;
+  stopBtn.onclick = stopCamera;
+
+  // Wait for OpenCV to be ready
+  function openCvReady() {
+    console.log('OpenCV.js loaded');
+    statusEl.textContent = 'OpenCV.js loaded. Loading detector...';
+    statusEl.appendChild(Object.assign(document.createElement('span'),{className:'loader'}));
+    loadDetector();
+    enumerateCameras();
+  }
+  function openCvError() {
+    statusEl.textContent = 'Failed to load OpenCV.js — some features may not work.';
+    loadDetector(); // still try loading detector
+    enumerateCameras();
+  }
+
+  // Load TensorFlow coco-ssd
+  async function loadDetector(){
+    try{
+      model = await cocoSsd.load();
+      console.log('coco-ssd model loaded');
+      statusEl.textContent = 'Ready — model loaded. Choose camera and press Start.';
+    }catch(err){
+      console.error(err);
+      statusEl.textContent = 'Failed to load detection model: ' + err.message;
+    }
+  }
+
+  // Enumerate cameras into dropdown
+  async function enumerateCameras(){
+    try{
+      const devices = await navigator.mediaDevices.enumerateDevices();
+      const cams = devices.filter(d => d.kind === 'videoinput');
+      camSelect.innerHTML = '';
+      cams.forEach((c, idx) => {
+        const opt = document.createElement('option');
+        opt.value = c.deviceId;
+        opt.text = c.label || `Camera ${idx + 1}`;
+        camSelect.appendChild(opt);
+      });
+      if (cams.length === 0) {
+        const opt = document.createElement('option');
+        opt.value = '';
+        opt.text = 'No camera found';
+        camSelect.appendChild(opt);
+      }
+    } catch(e){
+      console.warn('Could not enumerate devices', e);
+    }
+  }
+
+  // Start camera and detection
+  async function startCamera(){
+    if (!model) {
+      alert('Model still loading. Wait a moment and try again.');
+      return;
+    }
+    const deviceId = camSelect.value || undefined;
+    const constraints = {
+      audio: false,
+      video: deviceId ? { deviceId: { exact: deviceId }, width: { ideal: 640 }, height: { ideal: 480 } } : { facingMode: "environment", width: { ideal: 640 }, height: { ideal: 480 } }
+    };
+
+    try{
+      stream = await navigator.mediaDevices.getUserMedia(constraints);
+      video.srcObject = stream;
+      await video.play();
+
+      // Set canvas size to match video
+      canvas.width = video.videoWidth || 640;
+      canvas.height = video.videoHeight || 480;
+
+      detecting = true;
+      statusEl.textContent = 'Detecting...';
+      detectionLoop();
+    } catch(err){
+      console.error('Camera error', err);
+      statusEl.textContent = 'Error accessing camera: ' + err.message;
+      alert('Camera access is required. Allow camera in your browser and try again.');
+    }
+  }
+
+  // Stop everything
+  function stopCamera(){
+    detecting = false;
+    statusEl.textContent = 'Stopped.';
+    // stop tracks
+    if (stream) {
+      stream.getTracks().forEach(t => t.stop());
+      stream = null;
+    }
+    // clear canvas
+    ctx.clearRect(0,0,canvas.width,canvas.height);
+    detList.innerHTML = 'No detections.';
+  }
+
+  // Main detection loop
+  async function detectionLoop(){
+    if (!detecting) return;
+    try {
+      // draw current video frame onto canvas using OpenCV if available, else fallback to canvas drawImage
+      if (window.cv && cv instanceof Object) {
+        // Use OpenCV to read video frame and put on canvas (this step is optional but uses OpenCV per your request)
+        // Create cv.Mat from video
+        try {
+          let src = new cv.Mat(video.videoHeight, video.videoWidth, cv.CV_8UC4);
+          let cap = new cv.VideoCapture(video);
+          cap.read(src);
+          // convert color if needed (we keep as is)
+          cv.imshow(canvas, src);
+          src.delete();
+        } catch(e) {
+          // fallback
+          ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+        }
+      } else {
+        ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+      }
+
+      // Run detection on the current canvas image (coco-ssd can accept an HTMLCanvasElement directly)
+      const predictions = await model.detect(canvas);
+
+      // Clear overlay markings by redrawing frame behind (we already drew the frame)
+      // Draw boxes and labels
+      drawDetections(predictions);
+
+      // Update right panel list
+      updateList(predictions);
+
+    } catch(err){
+      console.error('Detection error', err);
+      statusEl.textContent = 'Detection error: ' + err.message;
+    } finally {
+      // schedule next detection
+      if (detecting) setTimeout(() => requestAnimationFrame(detectionLoop), detectInterval);
+    }
+  }
+
+  // Draw detections on canvas
+  function drawDetections(predictions){
+    // semi-transparent overlay over existing frame
+    ctx.lineWidth = Math.max(2, Math.round(Math.min(canvas.width, canvas.height) / 200));
+    ctx.font = `${Math.max(12, Math.round(canvas.height / 30))}px Arial`;
+    ctx.textBaseline = 'top';
+
+    predictions.forEach(pred => {
+      const [x, y, w, h] = pred.bbox;
+      const label = pred.class || 'object';
+      const score = (pred.score || 0).toFixed(2);
+
+      // bounding box
+      ctx.strokeStyle = 'rgba(6,182,212,0.9)';
+      ctx.fillStyle = 'rgba(6,182,212,0.12)';
+      ctx.beginPath();
+      ctx.rect(x, y, w, h);
+      ctx.fill();
+      ctx.stroke();
+
+      // label background
+      const text = `${label} (${(score*100).toFixed(0)}%)`;
+      const textWidth = ctx.measureText(text).width;
+      const pad = 6;
+      ctx.fillStyle = 'rgba(2,6,23,0.75)';
+      ctx.fillRect(x, y - (parseInt(ctx.font) + pad), textWidth + pad*2, parseInt(ctx.font) + pad);
+
+      // label text
+      ctx.fillStyle = 'white';
+      ctx.fillText(text, x + pad, y - parseInt(ctx.font));
+    });
+
+    if (predictions.length === 0) {
+      // optionally show "no objects"
+      ctx.fillStyle = 'rgba(255,255,255,0.02)';
+      ctx.fillRect(0,0,1,1); // no-op to keep canvas
+    }
+  }
+
+  // Update right-hand list with detected names and counts
+  function updateList(predictions){
+    if (!predictions || predictions.length === 0) {
+      detList.innerHTML = '<div class="item">No objects detected.</div>';
+      return;
+    }
+    // Group by class and keep highest score per object
+    const grouped = {};
+    predictions.forEach(p => {
+      const k = p.class;
+      if (!grouped[k]) grouped[k] = {count:0, best:0};
+      grouped[k].count += 1;
+      if ((p.score||0) > grouped[k].best) grouped[k].best = p.score;
+    });
+
+    detList.innerHTML = '';
+    Object.keys(grouped).forEach(k => {
+      const el = document.createElement('div');
+      el.className = 'item';
+      el.innerHTML = `<div class="label">${k}</div><div class="score">${grouped[k].count} • ${(grouped[k].best*100).toFixed(0)}%</div>`;
+      detList.appendChild(el);
+    });
+  }
+
+  // Clean up when page unloads
+  window.addEventListener('beforeunload', () => {
+    stopCamera();
+  });
+
+  // Handle device change (optional)
+  navigator.mediaDevices && navigator.mediaDevices.addEventListener && navigator.mediaDevices.addEventListener('devicechange', enumerateCameras);
+  </script>
+</body>
+</html>
